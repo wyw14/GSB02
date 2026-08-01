@@ -7,9 +7,20 @@ const assignments = ref([])
 const loading = ref(false)
 const toast = ref('')
 
+// 当前预览方案；为 null 表示没有待确认的预览。
+const preview = ref(null)
+// 旧预览是否已过期：过期后仍保留预览与确认入口，仅做标记并禁止保存。
+const previewExpired = ref(false)
+
 function showToast(msg) {
   toast.value = msg
   setTimeout(() => { toast.value = '' }, 2000)
+}
+
+// 锁定/解锁/清空等操作会改变服务端状态，使旧预览失效；
+// 保留预览与确认入口并标记为已过期，让用户能看到方案已过期，再次确认时给出提示。
+function invalidatePreview() {
+  if (preview.value) previewExpired.value = true
 }
 
 async function fetchData() {
@@ -23,12 +34,51 @@ async function fetchData() {
   assignments.value = await aRes.json()
 }
 
-async function doAssign() {
+async function doPreview() {
   loading.value = true
   try {
-    const res = await fetch('/api/assign', { method: 'POST' })
-    assignments.value = await res.json()
-    showToast('分配完成！')
+    const res = await fetch('/api/assign/preview', { method: 'POST' })
+    preview.value = await res.json()
+    // 重新生成的新预览恢复为可确认状态。
+    previewExpired.value = false
+  } finally {
+    loading.value = false
+  }
+}
+
+function cancelPreview() {
+  // 取消仅丢弃预览，不产生任何数据变化，页面恢复原状态。
+  preview.value = null
+  previewExpired.value = false
+  showToast('已取消预览')
+}
+
+async function confirmPreview() {
+  if (!preview.value) return
+  // 本地已知过期时直接提示，不发请求、不保存、不重新计算。
+  if (previewExpired.value) {
+    showToast('方案已过期，请重新生成')
+    return
+  }
+  loading.value = true
+  try {
+    const res = await fetch('/api/assign/commit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signature: preview.value.signature })
+    })
+    if (res.status === 409) {
+      // 服务端判定过期：保留预览与确认入口并标记过期，交由用户重新生成。
+      const err = await res.json()
+      previewExpired.value = true
+      showToast(err.message || '方案已过期，请重新生成')
+      return
+    }
+    const plan = await res.json()
+    assignments.value = plan.assignments
+    preview.value = null
+    previewExpired.value = false
+    showToast('分配已保存！')
   } finally {
     loading.value = false
   }
@@ -39,6 +89,7 @@ async function doClear() {
   try {
     const res = await fetch('/api/clear', { method: 'POST' })
     assignments.value = await res.json()
+    invalidatePreview()
     showToast('已清空所有分配')
   } finally {
     loading.value = false
@@ -52,6 +103,7 @@ async function doLock(memberId, seatId) {
     body: JSON.stringify({ memberId, seatId })
   })
   assignments.value = await res.json()
+  invalidatePreview()
   showToast('已锁定座位')
 }
 
@@ -62,6 +114,7 @@ async function doUnlock(memberId) {
     body: JSON.stringify({ memberId })
   })
   assignments.value = await res.json()
+  invalidatePreview()
   showToast('已解锁座位')
 }
 
@@ -147,12 +200,79 @@ onMounted(fetchData)
     </div>
 
     <div class="actions">
-      <button class="btn btn-primary" :disabled="loading" @click="doAssign">
-        🎯 一键分配座位
+      <button class="btn btn-primary" :disabled="loading" @click="doPreview">
+        🎯 生成分配预览
       </button>
       <button class="btn btn-danger" :disabled="loading || assignments.length === 0" @click="doClear">
         🗑️ 清空全部分配
       </button>
+    </div>
+
+    <div v-if="preview" :class="['preview-panel', previewExpired ? 'preview-panel-expired' : '']">
+      <div class="preview-header">
+        <div class="section-title">
+          🔍 分配预览（尚未保存）
+          <span v-if="previewExpired" class="preview-expired-badge">已过期</span>
+        </div>
+        <div class="preview-total">方案总得分：<strong>{{ preview.totalScore }}</strong></div>
+      </div>
+
+      <div v-if="previewExpired" class="preview-expired-note">
+        ⚠️ 方案已过期，请重新生成。此方案不能再保存。
+      </div>
+
+      <table class="preview-table">
+        <thead>
+          <tr>
+            <th>成员</th>
+            <th>座位</th>
+            <th>区域</th>
+            <th>靠窗偏好</th>
+            <th>安静偏好</th>
+            <th>个人得分</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in preview.assigned" :key="row.memberId">
+            <td>{{ row.memberName }} <span class="preview-team">{{ row.team }}</span></td>
+            <td>{{ row.seatId }}</td>
+            <td>{{ row.area }}</td>
+            <td>
+              <span v-if="row.windowMet === true" class="pref-met">✅ 满足</span>
+              <span v-else-if="row.windowMet === false" class="pref-unmet">❌ 未满足</span>
+              <span v-else class="pref-na">—</span>
+            </td>
+            <td>
+              <span v-if="row.quietMet === true" class="pref-met">✅ 满足</span>
+              <span v-else-if="row.quietMet === false" class="pref-unmet">❌ 未满足</span>
+              <span v-else class="pref-na">—</span>
+            </td>
+            <td>{{ row.score }}</td>
+            <td>
+              <span v-if="row.locked" class="preview-locked">🔒 锁定</span>
+              <span v-else class="preview-new">新分配</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div v-if="preview.unassignedMembers.length" class="preview-unassigned">
+        <div class="preview-subtitle">⚠️ 未分配到座位的成员</div>
+        <ul>
+          <li v-for="u in preview.unassignedMembers" :key="u.memberId">
+            {{ u.name }}（{{ u.team }}）
+            <span v-if="u.wantsWindow" class="tag tag-window">靠窗</span>
+            <span v-if="u.needsQuiet" class="tag tag-quiet">安静</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="preview-actions">
+        <button class="btn btn-primary" :disabled="loading" @click="confirmPreview">✅ 确认保存</button>
+        <button v-if="previewExpired" class="btn btn-primary" :disabled="loading" @click="doPreview">🔄 重新生成</button>
+        <button class="btn btn-secondary" :disabled="loading" @click="cancelPreview">✖ 取消</button>
+      </div>
     </div>
 
     <div class="legend" style="margin-bottom: 20px">
