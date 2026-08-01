@@ -6,6 +6,8 @@ const seats = ref([])
 const assignments = ref([])
 const loading = ref(false)
 const toast = ref('')
+// 服务端返回的结构化预览方案（含每项得分与偏好满足情况），确认前不改动任何数据
+const preview = ref(null)
 
 function showToast(msg) {
   toast.value = msg
@@ -23,15 +25,47 @@ async function fetchData() {
   assignments.value = await aRes.json()
 }
 
-async function doAssign() {
+async function doPreview() {
   loading.value = true
   try {
-    const res = await fetch('/api/assign', { method: 'POST' })
-    assignments.value = await res.json()
-    showToast('分配完成！')
+    const res = await fetch('/api/assign/preview', { method: 'POST' })
+    preview.value = await res.json()
   } finally {
     loading.value = false
   }
+}
+
+async function doConfirm() {
+  loading.value = true
+  try {
+    const res = await fetch('/api/assign/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ previewId: preview.value?.previewId })
+    })
+    if (res.status === 409) {
+      preview.value = null
+      showToast('方案已过期，请重新生成')
+      return
+    }
+    if (!res.ok) {
+      // 保存失败：保留当前预览与分配不变，仅提示失败
+      const body = await res.json().catch(() => ({}))
+      showToast(body.error || '保存失败，请重试')
+      return
+    }
+    assignments.value = await res.json()
+    preview.value = null
+    showToast('分配方案已保存！')
+  } catch (err) {
+    showToast('保存失败，请重试')
+  } finally {
+    loading.value = false
+  }
+}
+
+function doCancelPreview() {
+  preview.value = null
 }
 
 async function doClear() {
@@ -39,6 +73,7 @@ async function doClear() {
   try {
     const res = await fetch('/api/clear', { method: 'POST' })
     assignments.value = await res.json()
+    // 保留旧预览面板，确认时由服务端判定过期并提示
     showToast('已清空所有分配')
   } finally {
     loading.value = false
@@ -147,12 +182,59 @@ onMounted(fetchData)
     </div>
 
     <div class="actions">
-      <button class="btn btn-primary" :disabled="loading" @click="doAssign">
-        🎯 一键分配座位
+      <button class="btn btn-primary" :disabled="loading" @click="doPreview">
+        🎯 生成分配预览
       </button>
       <button class="btn btn-danger" :disabled="loading || assignments.length === 0" @click="doClear">
         🗑️ 清空全部分配
       </button>
+    </div>
+
+    <div v-if="preview" class="preview-panel">
+      <div class="section-title">🔍 分配预览（未保存）</div>
+      <table class="preview-table">
+        <thead>
+          <tr>
+            <th>成员</th>
+            <th>座位</th>
+            <th>区域</th>
+            <th>靠窗偏好</th>
+            <th>安静偏好</th>
+            <th>得分</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in preview.assignments" :key="item.memberId">
+            <td>
+              {{ memberMap[item.memberId]?.name }}
+              <span v-if="item.locked" class="tag tag-locked">🔒已锁定</span>
+            </td>
+            <td>{{ item.seatId }}</td>
+            <td>{{ seatMap[item.seatId]?.area }}</td>
+            <td>
+              <span v-if="item.windowMet === true" class="pref-met">✅满足</span>
+              <span v-else-if="item.windowMet === false" class="pref-unmet">❌未满足</span>
+              <span v-else class="pref-na">无偏好</span>
+            </td>
+            <td>
+              <span v-if="item.quietMet === true" class="pref-met">✅满足</span>
+              <span v-else-if="item.quietMet === false" class="pref-unmet">❌未满足</span>
+              <span v-else class="pref-na">无偏好</span>
+            </td>
+            <td>{{ item.score }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="preview-summary">
+        <span>总得分：<b>{{ preview.totalScore }}</b></span>
+        <span v-if="preview.unassigned.length > 0" class="preview-unassigned">
+          未分配成员：{{ preview.unassigned.map(id => memberMap[id]?.name || id).join('、') }}
+        </span>
+      </div>
+      <div class="preview-actions">
+        <button class="btn btn-primary" :disabled="loading" @click="doConfirm">✅ 确认保存</button>
+        <button class="btn btn-cancel" :disabled="loading" @click="doCancelPreview">❌ 取消</button>
+      </div>
     </div>
 
     <div class="legend" style="margin-bottom: 20px">

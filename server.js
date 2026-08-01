@@ -1,6 +1,8 @@
 const express = require('express')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
+const { buildAssignmentPlan, computeStateHash } = require('./allocation')
 
 const app = express()
 const PORT = 3000
@@ -9,12 +11,37 @@ app.use(express.json())
 
 const DATA_DIR = path.join(__dirname, 'data')
 
+// 服务端按 previewId 持有各页面的待确认预览：{ stateHash, assignments }，
+// 确认时同时校验标识与状态指纹，保证只保存发起确认的那个页面所展示的方案
+const pendingPreviews = new Map()
+
 function readJson(file) {
   return JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf-8'))
 }
 
 function writeJson(file, data) {
   fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2), 'utf-8')
+}
+
+// 先写临时文件再整体重命名，保证保存失败时不会留下只写入一部分的 assignments.json
+function writeJsonAtomic(file, data) {
+  const target = path.join(DATA_DIR, file)
+  const tmp = target + '.tmp'
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8')
+    fs.renameSync(tmp, target)
+  } catch (err) {
+    try { fs.unlinkSync(tmp) } catch (_) { /* 临时文件可能不存在，忽略 */ }
+    throw err
+  }
+}
+
+function readState() {
+  return {
+    members: readJson('members.json'),
+    seats: readJson('seats.json'),
+    assignments: readJson('assignments.json')
+  }
 }
 
 app.get('/api/members', (req, res) => {
@@ -31,30 +58,39 @@ app.get('/api/assignments', (req, res) => {
 
 app.put('/api/assignments', (req, res) => {
   writeJson('assignments.json', req.body)
+  pendingPreviews.clear()
   res.json({ ok: true })
 })
 
-app.post('/api/assign', (req, res) => {
-  const members = readJson('members.json')
-  const seats = readJson('seats.json')
-  let assignments = readJson('assignments.json')
+app.post('/api/assign/preview', (req, res) => {
+  const { members, seats, assignments } = readState()
+  const plan = buildAssignmentPlan(members, seats, assignments)
+  const previewId = crypto.randomUUID()
+  pendingPreviews.set(previewId, {
+    stateHash: computeStateHash(members, seats, assignments),
+    assignments: plan.assignments
+  })
+  res.json({ previewId, ...plan })
+})
 
-  const locked = assignments.filter(a => a.locked)
-  const lockedSeatIds = new Set(locked.map(a => a.seatId))
-  const lockedMemberIds = new Set(locked.map(a => a.memberId))
-
-  const freeSeats = seats.filter(s => !lockedSeatIds.has(s.id))
-  const freeMembers = members.filter(m => !lockedMemberIds.has(m.id))
-
-  const result = assignSeats(freeMembers, freeSeats)
-
-  const newAssignments = [
-    ...locked,
-    ...result.map(a => ({ ...a, locked: false }))
-  ]
-
-  writeJson('assignments.json', newAssignments)
-  res.json(newAssignments)
+app.post('/api/assign/confirm', (req, res) => {
+  const previewId = req.body && req.body.previewId
+  const pending = pendingPreviews.get(previewId)
+  const { members, seats, assignments } = readState()
+  const stateHash = computeStateHash(members, seats, assignments)
+  // 标识不存在或指纹不匹配都视为过期：页面展示的方案已不对应当前状态
+  if (!pending || pending.stateHash !== stateHash) {
+    pendingPreviews.delete(previewId)
+    return res.status(409).json({ error: '方案已过期，请重新生成' })
+  }
+  try {
+    writeJsonAtomic('assignments.json', pending.assignments)
+  } catch (err) {
+    return res.status(500).json({ error: '保存失败，请重试' })
+  }
+  const saved = pending.assignments
+  pendingPreviews.delete(previewId)
+  res.json(saved)
 })
 
 app.post('/api/lock', (req, res) => {
@@ -69,6 +105,7 @@ app.post('/api/lock', (req, res) => {
   })
 
   writeJson('assignments.json', assignments)
+  pendingPreviews.clear()
   res.json(assignments)
 })
 
@@ -84,47 +121,15 @@ app.post('/api/unlock', (req, res) => {
   })
 
   writeJson('assignments.json', assignments)
+  pendingPreviews.clear()
   res.json(assignments)
 })
 
 app.post('/api/clear', (req, res) => {
   writeJson('assignments.json', [])
+  pendingPreviews.clear()
   res.json([])
 })
-
-function assignSeats(members, seats) {
-  if (members.length === 0 || seats.length === 0) return []
-
-  const scored = []
-  for (const m of members) {
-    for (const s of seats) {
-      let score = 0
-      if (m.wantsWindow && s.isWindow) score += 10
-      if (m.wantsWindow && !s.isWindow) score -= 5
-      if (m.needsQuiet && s.isQuiet) score += 10
-      if (m.needsQuiet && !s.isQuiet) score -= 5
-      if (!m.wantsWindow && s.isWindow) score += 1
-      if (!m.needsQuiet && s.isQuiet) score += 1
-      scored.push({ memberId: m.id, seatId: s.id, score })
-    }
-  }
-
-  scored.sort((a, b) => b.score - a.score)
-
-  const usedMembers = new Set()
-  const usedSeats = new Set()
-  const assignments = []
-
-  for (const pair of scored) {
-    if (usedMembers.has(pair.memberId) || usedSeats.has(pair.seatId)) continue
-    assignments.push({ memberId: pair.memberId, seatId: pair.seatId })
-    usedMembers.add(pair.memberId)
-    usedSeats.add(pair.seatId)
-    if (usedMembers.size === members.length) break
-  }
-
-  return assignments
-}
 
 app.use(express.static(path.join(__dirname, 'client', 'dist')))
 
@@ -132,6 +137,10 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'client', 'dist', 'index.html'))
 })
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`)
-})
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`)
+  })
+}
+
+module.exports = app
