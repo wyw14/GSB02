@@ -1,0 +1,86 @@
+[
+  {
+    "id": "m1",
+    "name": "张伟",
+    "team": "前端组",
+    "wantsWindow": true,
+    "needsQuiet": false
+  },
+  {
+    "id": "m2",
+    "name": "李娜",
+    "team": "后端组",
+    "wantsWindow": false,
+    "needsQuiet": true
+  },
+  {
+    "id": "m3",
+    "name": "王磊",
+    "team": "产品组",
+    "wantsWindow": true,
+    "needsQuiet": true
+  },
+  {
+    "id": "m4",
+    "name": "赵敏",
+    "team": "设计组",
+    "wantsWindow": true,
+    "needsQuiet": false
+  },
+  {
+    "id": "m5",
+    "name": "陈浩",
+    "team": "后端组",
+    "wantsWindow": false,
+    "needsQuiet": true
+  },
+  {
+    "id": "m6",
+    "name": "刘洋",
+    "team": "前端组",
+    "wantsWindow": false,
+    "needsQuiet": false
+  },
+  {
+    "id": "m7",
+    "name": "孙婷",
+    "team": "测试组",
+    "wantsWindow": true,
+    "needsQuiet": false
+  },
+  {
+    "id": "m8",
+    "name": "周杰",
+    "team": "后端组",
+    "wantsWindow": false,
+    "needsQuiet": true
+  },
+  {
+    "id": "m9",
+    "name": "吴芳",
+    "team": "产品组",
+    "wantsWindow": false,
+    "needsQuiet": false
+  },
+  {
+    "id": "m10",
+    "name": "郑凯",
+    "team": "前端组",
+    "wantsWindow": true,
+    "needsQuiet": true
+  },
+  {
+    "id": "m11",
+    "name": "黄丽",
+    "team": "设计组",
+    "wantsWindow": false,
+    "needsQuiet": false
+  },
+  {
+    "id": "m12",
+    "name": "林强",
+    "team": "测试组",
+    "wantsWindow": true,
+    "needsQuiet": true
+  }
+]

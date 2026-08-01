@@ -1,0 +1,18 @@
+[
+  { "id": "s1",  "area": "A区", "isWindow": true,  "isQuiet": false },
+  { "id": "s2",  "area": "A区", "isWindow": true,  "isQuiet": false },
+  { "id": "s3",  "area": "A区", "isWindow": false, "isQuiet": false },
+  { "id": "s4",  "area": "A区", "isWindow": false, "isQuiet": false },
+  { "id": "s5",  "area": "B区", "isWindow": true,  "isQuiet": false },
+  { "id": "s6",  "area": "B区", "isWindow": true,  "isQuiet": false },
+  { "id": "s7",  "area": "B区", "isWindow": false, "isQuiet": true  },
+  { "id": "s8",  "area": "B区", "isWindow": false, "isQuiet": true  },
+  { "id": "s9",  "area": "C区", "isWindow": false, "isQuiet": true  },
+  { "id": "s10", "area": "C区", "isWindow": false, "isQuiet": true  },
+  { "id": "s11", "area": "C区", "isWindow": false, "isQuiet": true  },
+  { "id": "s12", "area": "C区", "isWindow": false, "isQuiet": false },
+  { "id": "s13", "area": "D区", "isWindow": true,  "isQuiet": true  },
+  { "id": "s14", "area": "D区", "isWindow": true,  "isQuiet": true  },
+  { "id": "s15", "area": "D区", "isWindow": false, "isQuiet": false },
+  { "id": "s16", "area": "D区", "isWindow": false, "isQuiet": false }
+]
