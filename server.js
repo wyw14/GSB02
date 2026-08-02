@@ -1,20 +1,111 @@
 const express = require('express')
 const fs = require('fs')
 const path = require('path')
+const {
+  buildPreview,
+  buildConfirmedAssignments,
+  computeFingerprint
+} = require('./assignment')
 
 const app = express()
-const PORT = 3000
+const PORT = process.env.PORT || 3000
 
 app.use(express.json())
 
-const DATA_DIR = path.join(__dirname, 'data')
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data')
+const REVISION_FILE = path.join(DATA_DIR, '.revision')
+
+// 服务端状态修订号：每次锁定/解锁/清空/确认成功后递增并持久化到磁盘。
+// 仅靠内容指纹无法识别"锁定后又解锁恢复原样"或"空状态下再次清空"这类操作；
+// 持久化保证服务重启后修订号不回退，重启前生成的旧预览仍永久失效。
+let stateRevision = readRevision()
+
+function readRevision() {
+  try {
+    const raw = fs.readFileSync(REVISION_FILE, 'utf-8')
+    const n = parseInt(raw, 10)
+    return Number.isFinite(n) && n >= 0 ? n : 0
+  } catch (e) {
+    return 0
+  }
+}
+
+/**
+ * 安全删除文件，文件不存在时忽略。
+ * @param {string} file
+ */
+function safeUnlink(file) {
+  try { fs.unlinkSync(file) } catch (e) {}
+}
+
+/**
+ * 事务式提交分配变更：同时写入 assignments.json 与 .revision。
+ * 先写两个临时文件，再依次原子重命名；若修订号重命名失败，回滚 assignments 到旧内容，
+ * 保证任一步写入失败都不留下数据变化。
+ * @param {Array} newAssignments 要写入的新分配数组
+ */
+function commitAssignmentChange(newAssignments) {
+  const assignmentsPath = path.join(DATA_DIR, 'assignments.json')
+  const revisionPath = REVISION_FILE
+  const assignmentsTmp = `${assignmentsPath}.tmp`
+  const revisionTmp = `${revisionPath}.tmp`
+  const rollbackTmp = `${assignmentsPath}.rollback.tmp`
+
+  // 读取旧内容用于回滚；文件不存在时视为空数组
+  let oldAssignmentsContent
+  try {
+    oldAssignmentsContent = fs.readFileSync(assignmentsPath, 'utf-8')
+  } catch (e) {
+    oldAssignmentsContent = '[]'
+  }
+
+  const nextRevision = stateRevision + 1
+
+  // 第一步：写两个临时文件，原文件尚未改动，失败可直接清理
+  fs.writeFileSync(assignmentsTmp, JSON.stringify(newAssignments, null, 2), 'utf-8')
+  try {
+    fs.writeFileSync(revisionTmp, String(nextRevision), 'utf-8')
+  } catch (e) {
+    safeUnlink(assignmentsTmp)
+    throw e
+  }
+
+  // 第二步：原子替换 assignments
+  let assignmentsCommitted = false
+  try {
+    fs.renameSync(assignmentsTmp, assignmentsPath)
+    assignmentsCommitted = true
+  } catch (e) {
+    safeUnlink(assignmentsTmp)
+    safeUnlink(revisionTmp)
+    throw e
+  }
+
+  // 第三步：原子替换 revision；失败则把 assignments 回滚到旧内容
+  try {
+    // 测试钩子：设置 FAIL_REVISION_WRITE=1 时模拟修订号写入失败，验证回滚
+    if (process.env.FAIL_REVISION_WRITE === '1') {
+      throw new Error('模拟修订号写入失败')
+    }
+    fs.renameSync(revisionTmp, revisionPath)
+  } catch (e) {
+    try {
+      fs.writeFileSync(rollbackTmp, oldAssignmentsContent, 'utf-8')
+      fs.renameSync(rollbackTmp, assignmentsPath)
+    } catch (rollbackErr) {
+      throw new Error(
+        `提交失败且回滚失败: ${e.message}; 回滚错误: ${rollbackErr.message}`
+      )
+    }
+    safeUnlink(revisionTmp)
+    throw e
+  }
+
+  stateRevision = nextRevision
+}
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf-8'))
-}
-
-function writeJson(file, data) {
-  fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2), 'utf-8')
 }
 
 app.get('/api/members', (req, res) => {
@@ -30,101 +121,100 @@ app.get('/api/assignments', (req, res) => {
 })
 
 app.put('/api/assignments', (req, res) => {
-  writeJson('assignments.json', req.body)
-  res.json({ ok: true })
+  try {
+    commitAssignmentChange(req.body)
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ error: '保存失败，数据未发生变化' })
+  }
 })
 
-app.post('/api/assign', (req, res) => {
+app.post('/api/assign/preview', (req, res) => {
   const members = readJson('members.json')
   const seats = readJson('seats.json')
-  let assignments = readJson('assignments.json')
+  const assignments = readJson('assignments.json')
+  const preview = buildPreview(members, seats, assignments)
+  res.json({ ...preview, revision: stateRevision })
+})
 
-  const locked = assignments.filter(a => a.locked)
-  const lockedSeatIds = new Set(locked.map(a => a.seatId))
-  const lockedMemberIds = new Set(locked.map(a => a.memberId))
+app.post('/api/assign/confirm', (req, res) => {
+  const { fingerprint, revision } = req.body || {}
+  const members = readJson('members.json')
+  const seats = readJson('seats.json')
+  const assignments = readJson('assignments.json')
 
-  const freeSeats = seats.filter(s => !lockedSeatIds.has(s.id))
-  const freeMembers = members.filter(m => !lockedMemberIds.has(m.id))
+  const currentFingerprint = computeFingerprint(members, seats, assignments)
+  // 修订号与内容指纹任一不匹配即判定过期：
+  // 修订号负责捕获"内容恢复原样但中间发生过写操作"的情况，
+  // 指纹负责捕获外部直接改文件等内容变化。
+  if (fingerprint !== currentFingerprint || revision !== stateRevision) {
+    return res.status(409).json({ error: '方案已过期，请重新生成' })
+  }
 
-  const result = assignSeats(freeMembers, freeSeats)
-
-  const newAssignments = [
-    ...locked,
-    ...result.map(a => ({ ...a, locked: false }))
-  ]
-
-  writeJson('assignments.json', newAssignments)
-  res.json(newAssignments)
+  const newAssignments = buildConfirmedAssignments(members, seats, assignments)
+  try {
+    commitAssignmentChange(newAssignments)
+    res.json({ ok: true, assignments: newAssignments })
+  } catch (e) {
+    res.status(500).json({ error: '保存失败，数据未发生变化' })
+  }
 })
 
 app.post('/api/lock', (req, res) => {
   const { memberId, seatId } = req.body
-  let assignments = readJson('assignments.json')
+  const assignments = readJson('assignments.json')
 
-  assignments = assignments.map(a => {
-    if (a.memberId === memberId && a.seatId === seatId) {
-      return { ...a, locked: true }
-    }
-    return a
-  })
+  // 锁定必须作用于真实存在的成员-座位分配；预览建议的座位不能直接锁定。
+  const target = assignments.find(
+    a => a.memberId === memberId && a.seatId === seatId
+  )
+  if (!target) {
+    return res.status(404).json({ error: '该座位分配不存在，无法锁定' })
+  }
 
-  writeJson('assignments.json', assignments)
-  res.json(assignments)
+  const updated = assignments.map(a =>
+    a.memberId === memberId && a.seatId === seatId
+      ? { ...a, locked: true }
+      : a
+  )
+
+  try {
+    commitAssignmentChange(updated)
+    res.json(updated)
+  } catch (e) {
+    res.status(500).json({ error: '锁定失败，数据未发生变化' })
+  }
 })
 
 app.post('/api/unlock', (req, res) => {
   const { memberId } = req.body
-  let assignments = readJson('assignments.json')
+  const assignments = readJson('assignments.json')
 
-  assignments = assignments.map(a => {
-    if (a.memberId === memberId) {
-      return { ...a, locked: false }
-    }
-    return a
-  })
+  const target = assignments.find(a => a.memberId === memberId)
+  if (!target) {
+    return res.status(404).json({ error: '该成员没有分配，无法解锁' })
+  }
 
-  writeJson('assignments.json', assignments)
-  res.json(assignments)
+  const updated = assignments.map(a =>
+    a.memberId === memberId ? { ...a, locked: false } : a
+  )
+
+  try {
+    commitAssignmentChange(updated)
+    res.json(updated)
+  } catch (e) {
+    res.status(500).json({ error: '解锁失败，数据未发生变化' })
+  }
 })
 
 app.post('/api/clear', (req, res) => {
-  writeJson('assignments.json', [])
-  res.json([])
+  try {
+    commitAssignmentChange([])
+    res.json([])
+  } catch (e) {
+    res.status(500).json({ error: '清空失败，数据未发生变化' })
+  }
 })
-
-function assignSeats(members, seats) {
-  if (members.length === 0 || seats.length === 0) return []
-
-  const scored = []
-  for (const m of members) {
-    for (const s of seats) {
-      let score = 0
-      if (m.wantsWindow && s.isWindow) score += 10
-      if (m.wantsWindow && !s.isWindow) score -= 5
-      if (m.needsQuiet && s.isQuiet) score += 10
-      if (m.needsQuiet && !s.isQuiet) score -= 5
-      if (!m.wantsWindow && s.isWindow) score += 1
-      if (!m.needsQuiet && s.isQuiet) score += 1
-      scored.push({ memberId: m.id, seatId: s.id, score })
-    }
-  }
-
-  scored.sort((a, b) => b.score - a.score)
-
-  const usedMembers = new Set()
-  const usedSeats = new Set()
-  const assignments = []
-
-  for (const pair of scored) {
-    if (usedMembers.has(pair.memberId) || usedSeats.has(pair.seatId)) continue
-    assignments.push({ memberId: pair.memberId, seatId: pair.seatId })
-    usedMembers.add(pair.memberId)
-    usedSeats.add(pair.seatId)
-    if (usedMembers.size === members.length) break
-  }
-
-  return assignments
-}
 
 app.use(express.static(path.join(__dirname, 'client', 'dist')))
 
